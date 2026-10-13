@@ -1,26 +1,39 @@
-import { allAddrs } from '../lib/store.js';
-import { fromHelius } from '../lib/format.js';
-import { notify } from '../lib/notify.js';
+import { redis } from './redis.js';
+import { allAddrs } from './store.js';
+import { chainOf } from './chain.js';
 
-// Receives Helius "enhanced" webhook batches (Solana).
-export default async function handler(req, res) {
-  if (req.headers.authorization !== process.env.WEBHOOK_SECRET) return res.status(401).end();
+export const publicUrl = () =>
+  process.env.PUBLIC_URL || `https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`;
 
-  const txs = Array.isArray(req.body) ? req.body : [];
-  const tracked = new Set(await allAddrs());
+// Keeps the Helius webhook's address list equal to every tracked Solana address.
+export async function syncWebhook() {
+  const key = process.env.HELIUS_API_KEY;
+  if (!key) return 'polling';
+  const base = 'https://api.helius.xyz/v0/webhooks';
+  const addrs = (await allAddrs()).filter((a) => chainOf(a) === 'sol');
+  const id = await redis.get('helius:webhook');
 
-  for (const tx of txs) {
-    try {
-      const involved = new Set([
-        tx.feePayer,
-        ...(tx.accountData || []).map((a) => a.account),
-        ...(tx.nativeTransfers || []).flatMap((t) => [t.fromUserAccount, t.toUserAccount]),
-        ...(tx.tokenTransfers || []).flatMap((t) => [t.fromUserAccount, t.toUserAccount]),
-      ]);
-      for (const addr of involved) if (tracked.has(addr)) await notify(addr, fromHelius(tx, addr));
-    } catch (e) {
-      console.error('helius tx error', tx?.signature, e);
+  if (!addrs.length) {
+    if (id) {
+      await fetch(`${base}/${id}?api-key=${key}`, { method: 'DELETE' });
+      await redis.del('helius:webhook');
     }
+    return 'ok';
   }
-  res.status(200).json({ ok: true });
+
+  const body = JSON.stringify({
+    webhookURL: `${publicUrl()}/api/helius`,
+    transactionTypes: ['ANY'],
+    accountAddresses: addrs,
+    webhookType: 'enhanced',
+    authHeader: process.env.WEBHOOK_SECRET,
+  });
+  const r = await fetch(id ? `${base}/${id}?api-key=${key}` : `${base}?api-key=${key}`, {
+    method: id ? 'PUT' : 'POST',
+    headers: { 'content-type': 'application/json' },
+    body,
+  });
+  if (!r.ok) throw new Error('Helius webhook sync failed: ' + (await r.text()));
+  if (!id) await redis.set('helius:webhook', String((await r.json()).webhookID));
+  return 'ok';
 }
